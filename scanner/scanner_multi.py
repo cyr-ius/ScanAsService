@@ -9,7 +9,7 @@ from typing import Any
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 
 # --- Config ---
-KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "192.168.1.1:9092")
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 INPUT_TOPIC = os.getenv("INPUT_TOPIC", "files_to_scan")
 OUTPUT_TOPIC = os.getenv("OUTPUT_TOPIC", "scan_results")
 
