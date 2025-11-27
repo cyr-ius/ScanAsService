@@ -85,8 +85,9 @@ services:
       S3_REGION: us-east-1
       CLAMD_HOST: clamav
       CLAMD_PORT: 3310
-      WORKER_POOL: "4"
-      MAX_THREADS: "8"
+      WORKER_POOL: 4
+      MAX_THREADS: 8
+      LOG_LEVEL: INFO
     tty: true
     stdin_open: true
 

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 import asyncio
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from typing import Any
 
+from aiobotocore.session import get_session
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 
 # --- Config ---
@@ -19,13 +21,16 @@ S3_SCAN_RESULT = os.getenv("S3_SCAN_RESULT", "processed")
 S3_SCAN_QUARANTINE = os.getenv("S3_SCAN_QUARANTINE", "quarantine")
 
 CLAMD_HOST = os.getenv("CLAMD_HOST", "clamav")
-CLAMD_PORT = int(os.getenv("CLAMD_PORT", "3310"))
+CLAMD_PORT = int(os.getenv("CLAMD_PORT", 3310))
 
-WORKER_POOL = int(os.getenv("WORKER_POOL", "4"))
+WORKER_POOL = int(os.getenv("WORKER_POOL", 4))
+
+LOGGER = logging.getLogger(__name__)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOGGER.setLevel(LOG_LEVEL)
+logging.basicConfig(level=LOG_LEVEL)
 
 # --- aiobotocore session ---
-from aiobotocore.session import get_session
-
 session = get_session()
 
 
@@ -116,10 +121,14 @@ async def worker(name: int, queue: asyncio.Queue, producer: AIOKafkaProducer):
             key = payload.get("key")
 
             if not (record_id and bucket and key):
-                print(f"[worker-{name}] Missing id/bucket/key -> skipping: {payload}")
+                LOGGER.info(
+                    f"[worker-{name}] Missing id/bucket/key -> skipping: {payload}"
+                )
                 continue
 
-            print(f"[worker-{name}] Start scan id={record_id} s3://{bucket}/{key}")
+            LOGGER.info(
+                f"[worker-{name}] Start scan id={record_id} s3://{bucket}/{key}"
+            )
 
             # -------- SCAN ----------
             scan = await scan_s3_object_async(bucket, key)
@@ -149,10 +158,12 @@ async def worker(name: int, queue: asyncio.Queue, producer: AIOKafkaProducer):
             await producer.send_and_wait(
                 OUTPUT_TOPIC, json.dumps(result).encode("utf-8")
             )
-            print(f"[worker-{name}] Scanned {key} → {status} → moved to {new_key}")
+            LOGGER.info(
+                f"[worker-{name}] Scanned {key} → {status} → moved to {new_key}"
+            )
 
         except Exception as e:
-            print(f"[worker-{name}] Error: {e}")
+            LOGGER.info(f"[worker-{name}] Error: {e}")
         finally:
             queue.task_done()
 
@@ -168,13 +179,13 @@ async def consume_loop(queue: asyncio.Queue):
         group_id="clamav-async-scanner-multi",
     )
     await consumer.start()
-    print("Kafka consumer started…")
+    LOGGER.info("Kafka consumer started…")
     try:
         async for msg in consumer:
             try:
                 payload = json.loads(msg.value.decode("utf-8"))
             except Exception:
-                print("Invalid message received")
+                LOGGER.warning("Invalid message received")
                 continue
 
             await queue.put(payload)
@@ -196,7 +207,9 @@ async def main():
     ]
     consumer_task = asyncio.create_task(consume_loop(queue))
 
-    print(f"Scanner multi-worker started: WORKER_POOL={WORKER_POOL} (fully async)")
+    LOGGER.info(
+        f"Scanner multi-worker started: WORKER_POOL={WORKER_POOL} (fully async)"
+    )
 
     try:
         await consumer_task
