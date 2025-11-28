@@ -21,8 +21,8 @@ from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 
 # --- Config from env ---
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-INPUT_TOPIC = os.getenv("INPUT_TOPIC", "files_to_scan")
-OUTPUT_TOPIC = os.getenv("OUTPUT_TOPIC", "scan_results")
+KAFKA_INPUT_TOPIC = os.getenv("KAFKA_INPUT_TOPIC", "files_to_scan")
+KAFKA_OUTPUT_TOPIC = os.getenv("KAFKA_OUTPUT_TOPIC", "scan_results")
 
 S3_ENDPOINT = os.getenv("S3_ENDPOINT_URL", "http://minio:9000")
 S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "minioadmin")
@@ -168,7 +168,7 @@ async def worker(
             }
 
             await producer.send_and_wait(
-                OUTPUT_TOPIC, json.dumps(result).encode("utf-8")
+                KAFKA_OUTPUT_TOPIC, json.dumps(result).encode("utf-8")
             )
 
             LOGGER.info(
@@ -187,7 +187,7 @@ async def worker(
 # ---------------------------------------------------------
 async def consume_loop(queue: asyncio.Queue):
     consumer = AIOKafkaConsumer(
-        INPUT_TOPIC,
+        KAFKA_INPUT_TOPIC,
         bootstrap_servers=KAFKA_BOOTSTRAP,
         enable_auto_commit=True,
         group_id="clamav-async-scanner-multi",
