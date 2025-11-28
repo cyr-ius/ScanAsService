@@ -9,6 +9,7 @@ Extended with:
 
 import asyncio
 import json
+import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -37,6 +38,11 @@ WORKER_POOL = int(os.getenv("WORKER_POOL", "4"))
 MAX_THREADS = int(os.getenv("MAX_THREADS", "8"))
 
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "7"))
+
+LOGGER = logging.getLogger(__name__)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOGGER.setLevel(LOG_LEVEL)
+logging.basicConfig(level=LOG_LEVEL)
 
 # --- Sync S3 client (used inside threadpool) ---
 s3_client = boto3.client(
@@ -118,15 +124,20 @@ async def worker(
         payload = await queue.get()
 
         try:
+            now = datetime.now(timezone.utc)
             record_id = payload.get("id")
             bucket = payload.get("bucket")
             key = payload.get("key")
 
             if not (record_id and bucket and key):
-                print(f"[worker-{name}] Missing id/bucket/key -> skipping: {payload}")
+                LOGGER.info(
+                    f"[worker-{name}] Missing id/bucket/key -> skipping: {payload}"
+                )
                 continue
 
-            print(f"[worker-{name}] Start scan id={record_id} s3://{bucket}/{key}")
+            LOGGER.info(
+                f"[worker-{name}] Start scan id={record_id} s3://{bucket}/{key}"
+            )
 
             # -------- SCAN ----------
             scan = await loop.run_in_executor(
@@ -142,6 +153,7 @@ async def worker(
                 new_key = f"{S3_SCAN_QUARANTINE}/{key}"
 
             await loop.run_in_executor(executor, move_s3_object, bucket, key, new_key)
+            finish = datetime.now(timezone.utc)
 
             # -------- SEND RESULT ----------
             result = {
@@ -151,6 +163,7 @@ async def worker(
                 "status": status,
                 "virus": scan.get("virus"),
                 "details": scan.get("details", ""),
+                "duration": str(finish - now),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
 
@@ -158,10 +171,12 @@ async def worker(
                 OUTPUT_TOPIC, json.dumps(result).encode("utf-8")
             )
 
-            print(f"[worker-{name}] Scanned {key} → {status} → moved to {new_key}")
+            LOGGER.info(
+                f"[worker-{name}] Scanned {key} → {status} → moved to {new_key}"
+            )
 
         except Exception as e:
-            print(f"[worker-{name}] Error: {e}")
+            LOGGER.info(f"[worker-{name}] Error: {e}")
 
         finally:
             queue.task_done()
@@ -178,13 +193,13 @@ async def consume_loop(queue: asyncio.Queue):
         group_id="clamav-async-scanner-multi",
     )
     await consumer.start()
-    print("Kafka consumer started…")
+
     try:
         async for msg in consumer:
             try:
                 payload = json.loads(msg.value.decode("utf-8"))
             except Exception:
-                print("Invalid message received")
+                LOGGER.info("Invalid message received")
                 continue
 
             await queue.put(payload)
@@ -210,7 +225,7 @@ def cleanup_s3_retention(bucket: str, days: int):
         last_modified = obj["LastModified"]
 
         if last_modified < cutoff:
-            print(f"[retention] Deleting {key} last modified on {last_modified}")
+            LOGGER.info(f"[retention] Deleting {key} last modified on {last_modified}")
             s3_client.delete_object(Bucket=bucket, Key=key)
 
 
@@ -218,7 +233,7 @@ async def retention_loop(bucket: str, executor: ThreadPoolExecutor):
     """Periodically cleans up old objects in the specified S3 bucket."""
     while True:
         loop = asyncio.get_running_loop()
-        print(f"[{bucket}] Running cleanup…")
+        LOGGER.info(f"[{bucket}] Running cleanup…")
         await loop.run_in_executor(
             executor, cleanup_s3_retention, bucket, RETENTION_DAYS
         )
@@ -247,7 +262,7 @@ async def main():
     retention_task = asyncio.create_task(retention_loop("quarantine", executor))
     processed_task = asyncio.create_task(retention_loop("processed", executor))
 
-    print(
+    LOGGER.info(
         f"Scanner multi-worker started: WORKER_POOL={WORKER_POOL} MAX_THREADS={MAX_THREADS}"
     )
 
