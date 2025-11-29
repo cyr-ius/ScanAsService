@@ -31,7 +31,7 @@ VERSION = os.getenv("APP_VERSION", "unknown")
 
 session = get_session()
 producer: AIOKafkaProducer
-logger = logging.getLogger("api")
+logger = logging.getLogger(__name__)
 logging.basicConfig(level=LOG_LEVEL)
 
 
