@@ -1,4 +1,4 @@
-# ScanAsService
+# ScanAV as Service (SAVaS)
 
 Permet de réaliser des scans antivirus de fichiers en mode service.
 Le moteur ClamAV sert d'antivirus. Kafka sert de bus de messages pour ordonner les scans et récupérer les résultats. MinIO sert de stockage S3 pour déposer/servir les fichiers scannés.

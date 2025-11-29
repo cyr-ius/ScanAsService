@@ -66,7 +66,9 @@ async def lifespan(app: FastAPI):
     logger.info("Shutdown complete")
 
 
-app = FastAPI(title="ScanAV API", lifespan=lifespan, version=VERSION)
+app = FastAPI(
+    title="ScanAV as Service (SAVaS) - API", lifespan=lifespan, version=VERSION
+)
 
 
 @app.post("/upload")
