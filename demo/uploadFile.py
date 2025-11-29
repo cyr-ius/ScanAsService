@@ -33,7 +33,10 @@ async def poll_result(session, record_id):
         async with session.get(f"{API_URL}/result/{record_id}") as resp:
             data = await resp.json()
             status = data.get("status")
-            if status in ("CLEAN", "INFECTED", "ERROR"):
+            if resp.status / 100 != 2:
+                print(f"Erreur récupération résultat pour {record_id} ({resp.status})")
+                return
+            if status in ("CLEAN", "INFECTED", "ERROR", "UNREACHABLE"):
                 print(f"Résultat pour {record_id}: {data}")
                 break
             else:
