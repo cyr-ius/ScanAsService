@@ -16,18 +16,6 @@ La section suivante documente toutes les variables et options que vous pouvez pa
 
 Remarque : certaines valeurs sont spécifiques à l'image Kafka et à sa configuration — adaptez-les selon votre environnement.
 
-### Variables générales (docker-compose / runtime)
-
-- CLAMD_HOSTS
-  - Description : liste de daemons ClamAV (host:port) séparés par des virgules.
-  - Exemple : "scanasservice-clamav-1:3310,scanasservice-clamav-2:3310"
-- WORKER_POOL
-  - Description : nombre de threads / workers dans le scanner.
-  - Exemple : 8
-- LOG_LEVEL
-  - Description : niveau de log (DEBUG, INFO, WARNING, ERROR)
-  - Exemple : INFO
-
 ### Service scanner (conteneur scanner)
 
 - KAFKA_SERVER
@@ -45,9 +33,57 @@ Remarque : certaines valeurs sont spécifiques à l'image Kafka et à sa configu
 - S3_ACCESS_KEY / S3_SECRET_KEY
   - Description : identifiants pour accéder à MinIO.
   - Exemple : minioadmin / minioadmin
-- CLAMD_HOSTS, WORKER_POOL, LOG_LEVEL (déjà listés ci‑dessus)
+- S3_BUCKET
+  - Description : bucket utilisé pour déposer les fichiers à scanner.
+  - Exemple : scans
+- S3_SCAN_RESULT
+  - Description : préfixe/dossier où placer les fichiers scannés (résultats CLEAN).
+  - Exemple : processed
+- S3_SCAN_QUARANTINE
+  - Description : préfixe/dossier où placer les fichiers détectés comme infectés.
+  - Exemple : quarantine
 
-Conseil : Dans docker-compose vous pouvez aussi changer `ports` et `volumes` pour exposer ou persister des données.
+- CLAMD_HOSTS
+  - Description : liste de daemons ClamAV (host:port) séparés par des virgules.
+  - Exemple : "clamav1:3310,clamav2:3310"
+- CLAMD_CNX_TIMEOUT
+  - Description : timeout (secondes) pour établir la connexion TCP vers clamd.
+  - Exemple : 10
+- CLAMD_RETRY
+  - Description : nombre de tentatives (sur différents hosts) avant d'abandonner le scan.
+  - Exemple : 3
+- BASE_DELAY
+  - Description : délai de base (secondes) utilisé pour backoff exponentiel entre tentatives.
+  - Exemple : 0.5
+
+- REDIS_URL
+  - Description : URL du service Redis utilisé pour verrouillage S3.
+  - Exemple : redis://redis:6379
+- REDIS_LOCK_TIMEOUT
+  - Description : durée (secondes) du verrou Redis sur un objet S3.
+  - Exemple : 15
+
+- WORKER_POOL
+  - Description : nombre de workers concurrents dans le scanner.
+  - Exemple : 4 (ou 8 selon docker-compose)
+
+- BUSY_WEIGHT
+  - Description : poids du nombre de tâches en cours dans l'algorithme d'équilibrage adaptatif.
+  - Exemple : 1.0
+- FAILURE_WEIGHT
+  - Description : poids appliqué au nombre d'échecs pour pénaliser un hôte.
+  - Exemple : 5.0
+- COOLDOWN_THRESHOLD
+  - Description : nombre d'échecs consécutifs avant qu'un host entre en cooldown.
+  - Exemple : 3
+- COOLDOWN_SECONDS
+  - Description : durée (secondes) du cooldown appliqué à un host après COOLDOWN_THRESHOLD échecs.
+  - Exemple : 60
+- EMA_ALPHA
+  - Description : alpha pour l'exponential moving average (moyenne mobile) du temps de scan.
+  - Exemple : 0.2
+
+Conseil : ajustez ces variables selon votre charge et votre topologie. Par exemple augmentez WORKER_POOL pour plus de parallélisme, ou réduisez CLAMD_RETRY si vos daemons sont instables.
 
 ### Service Kafka (variables Kafka importantes)
 
@@ -101,7 +137,12 @@ Notes Kafka :
 - MINIO_ROOT_USER / MINIO_ROOT_PASSWORD
   - Description : identifiants administrateur MinIO.
   - Exemple : minioadmin / minioadmin
-- S3_ENDPOINT_URL, S3_ACCESS_KEY, S3_SECRET_KEY (utilisés par le scanner pour se connecter)
+- S3_ENDPOINT_URL
+  - Description : endpoint MinIO / S3 pour stockage des fichiers.
+  - Exemple : http://minio:9000
+- S3_ACCESS_KEY / S3_SECRET_KEY
+  - Description : identifiants pour accéder à MinIO.
+  - Exemple : minioadmin / minioadmin
 
 MinIO options :
 
@@ -110,7 +151,6 @@ MinIO options :
 
 ### Service ClamAV
 
-- CLAMD_HOSTS (décrit plus haut) — adaptez la liste des daemons ClamAV.
 - Dans docker-compose l'exemple crée 2 réplicas :
   - deploy.replicas: 2
   - Vous pouvez augmenter ou diminuer le nombre d'instances ClamAV (ou utiliser `docker compose up --scale clamav=N`).
