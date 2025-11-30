@@ -79,19 +79,21 @@ services:
     build:
       context: .
     depends_on:
+      - redis
       - kafka
       - clamav
       - minio-init
     environment:
-      KAFKA_SERVERS: kafka:9092
+      CLAMD_HOSTS: scanasservice-clamav-1:3310,scanasservice-clamav-2:3310
       KAFKA_INPUT_TOPIC: files_to_scan
       KAFKA_OUTPUT_TOPIC: scan_results
-      S3_ENDPOINT_URL: http://minio:9000
-      S3_ACCESS_KEY: minioadmin
-      S3_SECRET_KEY: minioadmin
-      CLAMD_HOSTS: scanasservice-clamav-1:3310,scanasservice-clamav-2:3310
-      WORKER_POOL: 8
+      KAFKA_SERVERS: kafka:9092
       LOG_LEVEL: INFO
+      REDIS_URL: redis://redis:6379
+      S3_ACCESS_KEY: minioadmin
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_SECRET_KEY: minioadmin
+      WORKER_POOL: 8
     tty: true
     stdin_open: true
     ports:

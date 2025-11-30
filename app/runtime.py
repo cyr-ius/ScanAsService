@@ -180,6 +180,14 @@ async def worker(
                 worker=f"worker-{name}",
             )
 
+            # Trigger webhooks for this file_id
+            data = await storage.redis_client.get("scan_webhooks")
+            hooks = json.loads(data) if data else {}
+            for url in hooks.get(record_id, []):
+                asyncio.create_task(
+                    storage.call_webhook_and_remove(record_id, url, result.model_dump())
+                )
+
             try:
                 await producer.send_and_wait(
                     KAFKA_OUTPUT_TOPIC, result.model_dump_json().encode("utf-8")

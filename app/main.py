@@ -22,13 +22,21 @@ from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from helpers import KafkaMessage, ScanResult, retry_async
 from mylogging import mylogging
+from pydantic import BaseModel, HttpUrl
 from redis import asyncio as redis
 from starlette.background import BackgroundTask
+
+WEBHOOKS_KEY = "scan_webhooks"
 
 logger = mylogging.getLogger("api")
 session = get_session()
 producer: AIOKafkaProducer
 r = redis.from_url(REDIS_URL)
+
+
+class WebhookSubscription(BaseModel):
+    url: HttpUrl
+    file_id: str
 
 
 # Create a reusable asynccontextmanager for S3 client to ensure proper close
@@ -205,3 +213,39 @@ async def loadbalcenr_monitor():
             cresult.append(json.loads(v))
 
     return {"monitor": mresult, "clamav": cresult}
+
+
+@app.post("/webhooks/subscribe")
+async def subscribe_webhook(sub: WebhookSubscription):
+    data = await r.get(WEBHOOKS_KEY)
+    hooks = json.loads(data) if data else {}
+
+    hooks.setdefault(sub.file_id, [])
+    url_str = str(sub.url)
+    if url_str not in hooks[sub.file_id]:
+        hooks[sub.file_id].append(url_str)
+
+    await r.set("scan_webhooks", json.dumps(hooks))
+    return {"status": "subscribed", "file_id": sub.file_id, "url": url_str}
+
+
+@app.post("/webhooks/unsubscribe")
+async def unsubscribe_webhook(sub: WebhookSubscription):
+    data = await r.get(WEBHOOKS_KEY)
+    hooks = json.loads(data) if data else {}
+
+    url_str = str(sub.url)
+    if sub.file_id in hooks and url_str in hooks[sub.file_id]:
+        hooks[sub.file_id].remove(url_str)
+        if not hooks[sub.file_id]:
+            del hooks[sub.file_id]
+
+    await r.set(WEBHOOKS_KEY, json.dumps(hooks))
+    return {"status": "unsubscribed", "file_id": sub.file_id, "url": sub.url}
+
+
+@app.get("/webhooks/{file_id}")
+async def list_webhooks(file_id: str):
+    data = await r.get(WEBHOOKS_KEY)
+    hooks = json.loads(data) if data else {}
+    return {"file_id": file_id, "webhooks": hooks.get(file_id, [])}

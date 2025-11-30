@@ -5,6 +5,7 @@ import json
 import time
 
 from aiobotocore.session import ClientCreatorContext, get_session
+from aiohttp import ClientSession
 from helpers import ClamAVResult
 from mylogging import mylogging
 from redis import asyncio as redis
@@ -168,6 +169,29 @@ class S3Storage:
 
         except Exception as e:
             raise ClamAVException(f"clamd-scan-error:{e}") from e
+
+    async def call_webhook_and_remove(self, file_id: str, url: str, payload: dict):
+        try:
+            async with ClientSession() as session:
+                async with session.post(url, json=payload) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"Webhook {url} returned status {resp.status}")
+                    else:
+                        logger.info(
+                            f"Webhook {url} successfully called for file {file_id}"
+                        )
+        except Exception as e:
+            logger.error(f"Failed to call webhook {url} for file {file_id}: {e}")
+        finally:
+            # Remove URL from Redis after calling
+            data = await self.redis_client.get("scan_webhooks")
+            hooks = json.loads(data) if data else {}
+            if file_id in hooks and url in hooks[file_id]:
+                hooks[file_id].remove(url)
+                if not hooks[file_id]:
+                    del hooks[file_id]
+                await self.redis_client.set("scan_webhooks", json.dumps(hooks))
+                logger.debug(f"Webhook {url} unsubscribed for file {file_id}")
 
     async def update_monitor_state(self):
         try:
