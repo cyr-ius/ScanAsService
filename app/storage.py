@@ -3,7 +3,8 @@
 import asyncio
 import json
 import time
-from typing import  Any
+from typing import Any
+
 from aiobotocore.session import ClientCreatorContext, get_session
 from aiohttp import ClientSession
 from helpers import ClamAVResult
@@ -42,8 +43,13 @@ class S3Storage:
             aws_secret_access_key=self.secret,
         )
 
-    async def acquire_s3_lock(self, key: str, bucket: str, ) -> bool:
+    async def acquire_s3_lock(
+        self,
+        key: str,
+        bucket: str,
+    ) -> bool:
         try:
+            logger.debug("Acquiring lock for %s/%s")
             lock_key = f"lock:{bucket}/{key}"
             return await self.redis_client.set(
                 lock_key, "1", nx=True, ex=self.redis_timeout
@@ -54,6 +60,7 @@ class S3Storage:
 
     async def release_s3_lock(self, key: str, bucket: str) -> None:
         try:
+            logger.debug("Releasing lock for %s/%s")
             lock_key = f"lock:{bucket}/{key}"
             await self.redis_client.delete(lock_key)
         except Exception as e:
@@ -61,20 +68,21 @@ class S3Storage:
             raise S3UnlockException(f"s3-release-error:{e}") from e
 
     async def move_s3_object_async(
-        self,key: str, bucket: str,  result: ClamAVResult| None = None
+        self, key: str, bucket: str, target: str, result: ClamAVResult | None = None
     ) -> None:
         """Move or copy an object within S3 bucket."""
 
-        tagging = "&".join(f"{k}={v}" for k,v in result.items())
+        logger.debug("Moving %s/%s to %s", bucket, key, target)
+        tagging = "&".join(f"{k}={v}" for k, v in result.model_dump().items())
         async with await self._get_s3_client() as s3_client:
             try:
                 # Get headers and merge with new metada because copy_object
                 # lost old metadata on file
                 await s3_client.copy_object(
                     Bucket=bucket,
-                    Key=key,
+                    Key=target,
                     CopySource={"Bucket": bucket, "Key": key},
-                    Tagging=tagging
+                    Tagging=tagging,
                 )  # type: ignore
                 await s3_client.delete_object(Bucket=bucket, Key=key)  # type: ignore
             except Exception as e:
@@ -95,19 +103,20 @@ class S3Storage:
                     last_modified = obj["LastModified"].timestamp()
                     if last_modified < cutoff_ts:
                         try:
-                            await self.acquire_s3_lock(Bucket=bucket, Key=key)
+                            await self.acquire_s3_lock(bucket=bucket, key=key)
                             await s3_client.delete_object(Bucket=bucket, Key=key)  # type: ignore
                             logger.info(f"Deleted old object {bucket}/{key}")
                         except Exception as e:
                             logger.exception(f"Failed to delete {bucket}/{key}: {e}")
                         finally:
-                            await self.release_s3_lock(Bucket=bucket, Key=key)
+                            await self.release_s3_lock(bucket=bucket, key=key)
 
     async def scan_s3_object_async(
         self, key: str, bucket: str, host: str, port: int
     ) -> ClamAVResult:
         """Scan a single S3 file using a specific CLAMD host via INSTREAM."""
 
+        logger.debug("Scanning %s/%s", bucket, key)
         start_time = time.monotonic()
 
         # fetch S3 stream (fresh for each attempt)
@@ -173,26 +182,26 @@ class S3Storage:
         except Exception as e:
             raise ClamAVException(f"clamd-scan-error:{e}") from e
 
-    async def set_s3_tags(self, key:str, bucket:str, tags: dict[str,Any]):
+    async def set_s3_tags(self, key: str, bucket: str, tags: dict[str, Any]):
         """Set tags"""
         if len(tags) > 10:
             raise S3TaggingException("Tags numbers exceeded")
-        
-        tagging = "&".join(f"{k}={v}" for k,v in tags.items())
+
+        tagging = "&".join(f"{k}={v}" for k, v in tags.items())
         async with await self._get_s3_client() as s3_client:
             try:
-                await s3_client.put_object(Bucket=bucket, Key=key, tagging=tags)  # type: ignore
+                await s3_client.put_object(Bucket=bucket, Key=key, tagging=tagging)  # type: ignore
             except Exception as e:
-                raise S3TaggingException(f"s3-tags-error:{e}") from e        
+                raise S3TaggingException(f"s3-tags-error:{e}") from e
 
-    async def get_s3_metadata(self, key:str, bucket:str) -> dict[str, Any]:
+    async def get_s3_metadata(self, key: str, bucket: str) -> dict[str, Any]:
         """Get metadata."""
-        async with await self._get_s3_client() as s3_client:       
+        async with await self._get_s3_client() as s3_client:
             try:
                 head = await s3_client.head_object(Bucket=bucket, Key=key)  # type: ignore
                 return head.get("Metadata", {})
             except Exception as e:
-                raise S3MetadataException(f"s3-tags-error:{e}") from e    
+                raise S3MetadataException(f"s3-tags-error:{e}") from e
 
     async def call_webhook_and_remove(self, file_id: str, url: str, payload: dict):
         try:
@@ -253,14 +262,18 @@ class S3LockException(S3StorageException):
 class S3UnlockException(S3StorageException):
     """Custom exception for S3 unlock errors."""
 
+
 class S3MetadataException(S3StorageException):
     """Custom exception for S3 unlock errors."""
+
 
 class ClamAVException(Exception):
     """Custom exception for scan result fetch errors."""
 
+
 class ClamAVScanException(ClamAVException):
     """Scan Exception"""
+
 
 class ClamAVFailedAll(ClamAVException):
     """All ClamAV failed."""

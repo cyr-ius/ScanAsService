@@ -2,7 +2,6 @@
 import asyncio
 import json
 import time
-from datetime import datetime
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from const import (
@@ -10,9 +9,9 @@ from const import (
     CLAMD_CNX_TIMEOUT,
     CLAMD_HOSTS,
     CLAMD_RETRY,
-    KAFKA_TOPIC,
     KAFKA_LOG_RETENTION_MS,
     KAFKA_SERVERS,
+    KAFKA_TOPIC,
     REDIS_LOCK_TIMEOUT,
     REDIS_URL,
     S3_ACCESS_KEY,
@@ -28,11 +27,11 @@ from monitor import Monitor
 from mylogging import mylogging
 from storage import (
     ClamAVException,
+    ClamAVFailedAll,
     S3LockException,
     S3MoveException,
     S3Storage,
     S3UnlockException,
-    ClamAVFailedAll,
 )
 
 logger = mylogging.getLogger("scanav")
@@ -52,7 +51,7 @@ async def worker(
     while True:
         payload = await queue.get()
         try:
-            start_timestamp = datetime.now().timestamp()
+            # start_timestamp = datetime.now().timestamp()
             bucket = payload["bucket"]
             key = payload["key"]
 
@@ -76,15 +75,11 @@ async def worker(
                 await monitor.mark_host_busy(host_key)
                 scan_start = time.monotonic()
                 try:
-                    scan = await storage.scan_s3_object_async(
-                        key, bucket, host, port
-                    )
+                    scan = await storage.scan_s3_object_async(key, bucket, host, port)
                 except ClamAVException as e:
                     elapsed = time.monotonic() - scan_start
                     # mark done with failure (no elapsed update)
-                    await monitor.mark_host_done(
-                        host_key, elapsed=None, success=False
-                    )
+                    await monitor.mark_host_done(host_key, elapsed=None, success=False)
                     logger.warning(
                         f"[worker-{name}] ClamAV attempt failed on {host_key}: {e} (attempt {attempt})"
                     )
@@ -95,7 +90,9 @@ async def worker(
                 else:
                     elapsed = time.monotonic() - scan_start
                     # success or deterministic error from engine -> mark done success if CLEAN/INFECTED, else success False
-                    await monitor.mark_host_done(host_key, elapsed=elapsed, success=True)
+                    await monitor.mark_host_done(
+                        host_key, elapsed=elapsed, success=True
+                    )
                     break  # exit retry loop
 
             else:
@@ -106,17 +103,17 @@ async def worker(
                 raise ClamAVFailedAll(last_exception)
 
             # move object according to result if scan succeeded (or even on ERROR we may want to move to quarantine)
-            key = (
+            target = (
                 f"{S3_SCAN_RESULT}/{key}"
                 if scan.status == "CLEAN"
                 else f"{S3_SCAN_QUARANTINE}/{key}"
             )
-            await storage.move_s3_object_async(key, bucket, scan)
+            await storage.move_s3_object_async(key, bucket, target, scan)
 
             logger.info(f"[worker-{name}] Scanned {key} → {scan.status}")
 
             # release S3 lock
-            await storage.release_s3_lock(key,bucket)
+            await storage.release_s3_lock(key, bucket)
 
         except S3LockException as e:
             logger.error(f"[worker-{name}] Lock error: {e}")
@@ -133,10 +130,18 @@ async def worker(
         else:
             # Trigger webhooks for this file_id
             metadata = await storage.get_s3_metadata(key=key, bucket=bucket)
-            result = ScanResult(key=key, bucket=bucket, status=scan.status, virus=scan.virus, detail= scan.details)
+            result = ScanResult(
+                key=key,
+                bucket=bucket,
+                status=scan.status,
+                virus=scan.virus,
+                detail=scan.details,
+            )
             if url := metadata.get("Webhook"):
                 asyncio.create_task(
-                    retry_async(storage.call_webhook_and_remove(key, url, result.model_dump()))
+                    retry_async(
+                        storage.call_webhook_and_remove(key, url, result.model_dump())
+                    )
                 )
 
         finally:

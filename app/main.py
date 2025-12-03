@@ -1,29 +1,27 @@
 # main.py
-import asyncio
 import json
-from socket import getfqdn
 import uuid
 from contextlib import asynccontextmanager
 
 from aiobotocore.session import AioSession, get_session
-from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from aiokafka import AIOKafkaProducer
 from const import (
-    KAFKA_TOPIC,
     KAFKA_SERVERS,
+    KAFKA_TOPIC,
     REDIS_URL,
     S3_ACCESS_KEY,
     S3_BUCKET,
     S3_ENDPOINT,
+    S3_SCAN_QUARANTINE,
+    S3_SCAN_RESULT,
     S3_SECRET_KEY,
     VERSION,
-    S3_SCAN_RESULT,
-    S3_SCAN_QUARANTINE
 )
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from helpers import KafkaMessage, ScanResult, retry_async
 from mylogging import mylogging
-from pydantic import BaseModel, HttpUrl
+from pydantic import HttpUrl
 from redis import asyncio as redis
 from starlette.background import BackgroundTask
 
@@ -72,20 +70,24 @@ app = FastAPI(
 
 
 @app.post("/upload")
-async def upload_file_to_scan(file: UploadFile , url: HttpUrl |None = None ) -> ScanResult:
+async def upload_file_to_scan(
+    file: UploadFile, url: HttpUrl | None = None
+) -> ScanResult:
     """Upload file to S3 and send scan request to Kafka."""
     key = str(uuid.uuid4())
     data = await file.read()
     try:
         async with s3_client_ctx() as client:  # type: ignore
-            metadata = {"OriginalFilename":file.filename, "Webhook":url}
-            await client.put_object(Bucket=S3_BUCKET, Key=key, Body=data, Metadata=metadata)  # type: ignore
+            metadata = {"OriginalFilename": file.filename}
+            await client.put_object(
+                Bucket=S3_BUCKET, Key=key, Body=data, Metadata=metadata
+            )  # type: ignore
     except Exception as e:
         logger.exception("S3 put_object failed")
         raise HTTPException(status_code=503, detail=f"Storage unavailable: {e}")
 
     # Send Kafka message with retries
-    payload = KafkaMessage(Key=key, bucket=S3_BUCKET)
+    payload = KafkaMessage(key=key, bucket=S3_BUCKET, status="PENDING")
 
     try:
         await producer.send_and_wait(
@@ -114,7 +116,7 @@ async def download_scanned_file(id: str, force: bool = False) -> StreamingRespon
 
     try:
         resp = await retry_async(_get, retries=6, base_delay=0.5)
-        filename = resp.get("Metadata", {}).get("OriginalFilename","unkown_name")
+        filename = resp.get("Metadata", {}).get("OriginalFilename", "unkown_name")
         body = resp["Body"]
         headers = {"Content-Disposition": f"attachment; filename={filename}"}
         return StreamingResponse(
@@ -138,17 +140,17 @@ async def scan_status(id: str) -> ScanResult:
     async with s3_client_ctx() as s3_client:
         for bucket in [S3_BUCKET, S3_SCAN_RESULT, S3_SCAN_QUARANTINE]:
             try:
-                obj = await s3_client.get_object_tagging(Bucket=bucket, Key=id) 
+                obj = await s3_client.get_object_tagging(Bucket=bucket, Key=id)
                 if tags := obj.get("TagSet"):
-                    tags = {t["Key"]:t["Value"] for t in tags}
+                    tags = {t["Key"]: t["Value"] for t in tags}
                 break
-            except Exception as e:
+            except Exception:
                 continue
         if bucket == S3_BUCKET:
             return ScanResult(key=id, status_code=202, detail="File is pending scan")
         if tags.get("status") in ["CLEAN", "INFECTED"]:
             return ScanResult(key=id, bucket=bucket, **tags)
-        
+
         return ScanResult(key=id, status="ERROR", detail="File not found")
 
 
@@ -176,4 +178,3 @@ async def loadbalcenr_monitor():
             cresult.append(json.loads(v))
 
     return {"monitor": mresult, "clamav": cresult}
-
