@@ -1,22 +1,23 @@
 # main.py
 import asyncio
 import json
+from socket import getfqdn
 import uuid
 from contextlib import asynccontextmanager
 
 from aiobotocore.session import AioSession, get_session
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from const import (
-    KAFKA_INPUT_TOPIC,
-    KAFKA_OUTPUT_TOPIC,
+    KAFKA_TOPIC,
     KAFKA_SERVERS,
     REDIS_URL,
     S3_ACCESS_KEY,
     S3_BUCKET,
     S3_ENDPOINT,
     S3_SECRET_KEY,
-    SEARCH_TIMEOUT,
     VERSION,
+    S3_SCAN_RESULT,
+    S3_SCAN_QUARANTINE
 )
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
@@ -32,11 +33,6 @@ logger = mylogging.getLogger("api")
 session = get_session()
 producer: AIOKafkaProducer
 r = redis.from_url(REDIS_URL)
-
-
-class WebhookSubscription(BaseModel):
-    url: HttpUrl
-    file_id: str
 
 
 # Create a reusable asynccontextmanager for S3 client to ensure proper close
@@ -76,36 +72,30 @@ app = FastAPI(
 
 
 @app.post("/upload")
-async def upload_file_to_scan(file: UploadFile) -> KafkaMessage:
+async def upload_file_to_scan(file: UploadFile , url: HttpUrl |None = None ) -> ScanResult:
     """Upload file to S3 and send scan request to Kafka."""
-    unique_key = f"{uuid.uuid4()}_{file.filename}"
+    key = str(uuid.uuid4())
     data = await file.read()
-
     try:
         async with s3_client_ctx() as client:  # type: ignore
-            await client.put_object(Bucket=S3_BUCKET, Key=unique_key, Body=data)  # type: ignore
+            metadata = {"OriginalFilename":file.filename, "Webhook":url}
+            await client.put_object(Bucket=S3_BUCKET, Key=key, Body=data, Metadata=metadata)  # type: ignore
     except Exception as e:
         logger.exception("S3 put_object failed")
         raise HTTPException(status_code=503, detail=f"Storage unavailable: {e}")
 
     # Send Kafka message with retries
-    payload = KafkaMessage(
-        id=str(uuid.uuid4()),
-        status="PENDING",
-        bucket=S3_BUCKET,
-        key=unique_key,
-        original_filename=file.filename,
-    )
+    payload = KafkaMessage(Key=key, bucket=S3_BUCKET)
 
     try:
         await producer.send_and_wait(
-            KAFKA_INPUT_TOPIC, value=payload.model_dump_json().encode("utf-8")
+            KAFKA_TOPIC, value=payload.model_dump_json().encode("utf-8")
         )
     except Exception as e:
         logger.exception("Kafka send failed (%s)", e)
         raise HTTPException(status_code=503, detail=f"Message broker unavailable: {e}")
 
-    return payload
+    return ScanResult(key=key, status="PENDING", webhook=url)
 
 
 @app.get("/download/{id}")
@@ -117,8 +107,6 @@ async def download_scanned_file(id: str, force: bool = False) -> StreamingRespon
     if result.status != "CLEAN" and not force:
         raise HTTPException(status_code=404, detail=result.details)
 
-    filename = getattr(result, "original_filename", "downloaded_file")
-
     # Use s3_client_ctx
     async def _get() -> AioSession:
         async with s3_client_ctx() as s3_client:
@@ -126,6 +114,7 @@ async def download_scanned_file(id: str, force: bool = False) -> StreamingRespon
 
     try:
         resp = await retry_async(_get, retries=6, base_delay=0.5)
+        filename = resp.get("Metadata", {}).get("OriginalFilename","unkown_name")
         body = resp["Body"]
         headers = {"Content-Disposition": f"attachment; filename={filename}"}
         return StreamingResponse(
@@ -145,48 +134,22 @@ async def download_scanned_file(id: str, force: bool = False) -> StreamingRespon
 @app.get("/result/{id}")
 async def scan_status(id: str) -> ScanResult:
     """Fetch scan result by ID."""
-    consumer = AIOKafkaConsumer(
-        KAFKA_OUTPUT_TOPIC,
-        bootstrap_servers=KAFKA_SERVERS,  # type: ignore
-        auto_offset_reset="earliest",
-        enable_auto_commit=True,
-        group_id=f"api-tracker-{uuid.uuid4()}",
-    )
 
-    # start consumer with retry
-    try:
-        await consumer.start()
-    except Exception as e:
-        logger.exception("Kafka consumer start failed")
-        raise HTTPException(status_code=503, detail=str(e))
-
-    try:
-        deadline = asyncio.get_event_loop().time() + SEARCH_TIMEOUT
-
-        while True:
-            remaining = deadline - asyncio.get_event_loop().time()
-            if remaining <= 0:
-                break
-
+    async with s3_client_ctx() as s3_client:
+        for bucket in [S3_BUCKET, S3_SCAN_RESULT, S3_SCAN_QUARANTINE]:
             try:
-                batch = await consumer.getmany(timeout_ms=int(remaining * 1000))
+                obj = await s3_client.get_object_tagging(Bucket=bucket, Key=id) 
+                if tags := obj.get("TagSet"):
+                    tags = {t["Key"]:t["Value"] for t in tags}
+                break
             except Exception as e:
-                logger.warning("[api] Error polling consumer, will retry: %s", e)
-                await asyncio.sleep(0.5)
                 continue
-
-            for _, messages in batch.items():
-                for msg in messages:
-                    if msg.value is None:
-                        continue
-                    payload = json.loads(msg.value.decode())
-                    if payload.get("id") == id:
-                        return ScanResult(**payload)
-
-        raise HTTPException(status_code=503, detail="Result not ready yet")
-
-    finally:
-        await consumer.stop()
+        if bucket == S3_BUCKET:
+            return ScanResult(key=id, status_code=202, detail="File is pending scan")
+        if tags.get("status") in ["CLEAN", "INFECTED"]:
+            return ScanResult(key=id, bucket=bucket, **tags)
+        
+        return ScanResult(key=id, status="ERROR", detail="File not found")
 
 
 @app.get("/heartbeat", status_code=204)
@@ -214,38 +177,3 @@ async def loadbalcenr_monitor():
 
     return {"monitor": mresult, "clamav": cresult}
 
-
-@app.post("/webhooks/subscribe")
-async def subscribe_webhook(sub: WebhookSubscription):
-    data = await r.get(WEBHOOKS_KEY)
-    hooks = json.loads(data) if data else {}
-
-    hooks.setdefault(sub.file_id, [])
-    url_str = str(sub.url)
-    if url_str not in hooks[sub.file_id]:
-        hooks[sub.file_id].append(url_str)
-
-    await r.set("scan_webhooks", json.dumps(hooks))
-    return {"status": "subscribed", "file_id": sub.file_id, "url": url_str}
-
-
-@app.post("/webhooks/unsubscribe")
-async def unsubscribe_webhook(sub: WebhookSubscription):
-    data = await r.get(WEBHOOKS_KEY)
-    hooks = json.loads(data) if data else {}
-
-    url_str = str(sub.url)
-    if sub.file_id in hooks and url_str in hooks[sub.file_id]:
-        hooks[sub.file_id].remove(url_str)
-        if not hooks[sub.file_id]:
-            del hooks[sub.file_id]
-
-    await r.set(WEBHOOKS_KEY, json.dumps(hooks))
-    return {"status": "unsubscribed", "file_id": sub.file_id, "url": sub.url}
-
-
-@app.get("/webhooks/{file_id}")
-async def list_webhooks(file_id: str):
-    data = await r.get(WEBHOOKS_KEY)
-    hooks = json.loads(data) if data else {}
-    return {"file_id": file_id, "webhooks": hooks.get(file_id, [])}

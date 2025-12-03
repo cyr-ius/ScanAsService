@@ -10,9 +10,8 @@ from const import (
     CLAMD_CNX_TIMEOUT,
     CLAMD_HOSTS,
     CLAMD_RETRY,
-    KAFKA_INPUT_TOPIC,
+    KAFKA_TOPIC,
     KAFKA_LOG_RETENTION_MS,
-    KAFKA_OUTPUT_TOPIC,
     KAFKA_SERVERS,
     REDIS_LOCK_TIMEOUT,
     REDIS_URL,
@@ -24,7 +23,7 @@ from const import (
     S3_SECRET_KEY,
     WORKER_POOL,
 )
-from helpers import ScanResult
+from helpers import ScanResult, retry_async
 from monitor import Monitor
 from mylogging import mylogging
 from storage import (
@@ -33,6 +32,7 @@ from storage import (
     S3MoveException,
     S3Storage,
     S3UnlockException,
+    ClamAVFailedAll,
 )
 
 logger = mylogging.getLogger("scanav")
@@ -53,147 +53,91 @@ async def worker(
         payload = await queue.get()
         try:
             start_timestamp = datetime.now().timestamp()
-            record_id = payload["id"]
             bucket = payload["bucket"]
             key = payload["key"]
-            original_filename = payload.get("original_filename")
-            status = "PENDING"
-            virus = None
-            instance = None
-            detail = None
-            analyse = None
 
             logger.info(f"[worker-{name}] Start scan {key}")
 
             # Acquire lock
-            try:
-                if not await storage.acquire_s3_lock(bucket, key):
-                    logger.warning(f"[worker-{name}] File locked, skipping {key}")
-                    queue.task_done()
-                    continue
-            except S3LockException as e:
-                logger.error(f"[worker-{name}] Lock error: {e}")
-                status = "ERROR"
-                detail = f"lock-error:{e}"
+            if not await storage.acquire_s3_lock(key, bucket):
+                logger.warning(f"[worker-{name}] File locked, skipping {key}")
+                queue.task_done()
+                continue
 
             # Scan file using adaptive selection
-            if status != "ERROR":
-                attempt = 0
-                last_exception = None
-                while attempt < CLAMD_RETRY:
-                    attempt += 1
-                    # choose best host
-                    host, port, host_key = await monitor.select_best_host()
+            attempt = 0
+            last_exception = None
+            while attempt < CLAMD_RETRY:
+                attempt += 1
+                # choose best host
+                host, port, host_key = await monitor.select_best_host()
 
-                    # mark busy
-                    await monitor.mark_host_busy(host_key)
-                    scan_start = time.monotonic()
-                    try:
-                        scan = await storage.scan_s3_object_async(
-                            record_id, bucket, key, host, port
-                        )
-                    except ClamAVException as e:
-                        elapsed = time.monotonic() - scan_start
-                        # mark done with failure (no elapsed update)
-                        await monitor.mark_host_done(
-                            host_key, elapsed=None, success=False
-                        )
-                        logger.warning(
-                            f"[worker-{name}] ClamAV attempt failed on {host_key}: {e} (attempt {attempt})"
-                        )
-                        last_exception = e
-                        # small backoff before next attempt
-                        await asyncio.sleep(BASE_DELAY * (2 ** (attempt - 1)))
-                        continue
-                    else:
-                        elapsed = time.monotonic() - scan_start
-                        # success or deterministic error from engine -> mark done success if CLEAN/INFECTED, else success False
-                        if scan.status in ("CLEAN", "INFECTED"):
-                            await monitor.mark_host_done(
-                                host_key, elapsed=elapsed, success=True
-                            )
-                        else:
-                            # engine returned ERROR -> treat as success (we received a response) but don't count as success for avg maybe?
-                            await monitor.mark_host_done(
-                                host_key, elapsed=elapsed, success=True
-                            )
-                        # set results
-                        status = scan.status
-                        detail = scan.details
-                        virus = scan.virus
-                        instance = scan.instance
-                        analyse = scan.analyse
-                        break  # exit retry loop
-
+                # mark busy
+                await monitor.mark_host_busy(host_key)
+                scan_start = time.monotonic()
+                try:
+                    scan = await storage.scan_s3_object_async(
+                        key, bucket, host, port
+                    )
+                except ClamAVException as e:
+                    elapsed = time.monotonic() - scan_start
+                    # mark done with failure (no elapsed update)
+                    await monitor.mark_host_done(
+                        host_key, elapsed=None, success=False
+                    )
+                    logger.warning(
+                        f"[worker-{name}] ClamAV attempt failed on {host_key}: {e} (attempt {attempt})"
+                    )
+                    last_exception = e
+                    # small backoff before next attempt
+                    await asyncio.sleep(BASE_DELAY * (2 ** (attempt - 1)))
+                    continue
                 else:
-                    # exhausted retries
-                    logger.error(
-                        f"[worker-{name}] All CLAMD attempts failed for {key}: {last_exception}"
-                    )
-                    status = "ERROR"
-                    detail = f"clamd-unreachable:{last_exception}"
+                    elapsed = time.monotonic() - scan_start
+                    # success or deterministic error from engine -> mark done success if CLEAN/INFECTED, else success False
+                    await monitor.mark_host_done(host_key, elapsed=elapsed, success=True)
+                    break  # exit retry loop
 
-                # move object according to result if scan succeeded (or even on ERROR we may want to move to quarantine)
-                if status != "PENDING":
-                    new_key = (
-                        f"{S3_SCAN_RESULT}/{key}"
-                        if status == "CLEAN"
-                        else f"{S3_SCAN_QUARANTINE}/{key}"
-                    )
-                    try:
-                        await storage.move_s3_object_async(bucket, key, new_key)
-                    except S3MoveException as e:
-                        logger.error(f"[worker-{name}] Move error: {e}")
-                        status = "ERROR"
-                        detail = f"move-error:{e}"
-                    else:
-                        key = new_key
-                        logger.info(f"[worker-{name}] Scanned {key} → {status}")
+            else:
+                # exhausted retries
+                logger.error(
+                    f"[worker-{name}] All CLAMD attempts failed for {key}: {last_exception}"
+                )
+                raise ClamAVFailedAll(last_exception)
+
+            # move object according to result if scan succeeded (or even on ERROR we may want to move to quarantine)
+            key = (
+                f"{S3_SCAN_RESULT}/{key}"
+                if scan.status == "CLEAN"
+                else f"{S3_SCAN_QUARANTINE}/{key}"
+            )
+            await storage.move_s3_object_async(key, bucket, scan)
+
+            logger.info(f"[worker-{name}] Scanned {key} → {scan.status}")
 
             # release S3 lock
-            try:
-                await storage.release_s3_lock(bucket, key)
-            except S3UnlockException as e:
-                logger.error(f"[worker-{name}] Unlock error: {e}")
-                status = "ERROR"
-                detail = f"unlock-error:{e}"
+            await storage.release_s3_lock(key,bucket)
+
+        except S3LockException as e:
+            logger.error(f"[worker-{name}] Lock error: {e}")
+
+        except S3MoveException as e:
+            logger.error(f"[worker-{name}] Move error: {e}")
+
+        except S3UnlockException as e:
+            logger.error(f"[worker-{name}] Unlock error: {e}")
 
         except Exception as e:
             logger.error(f"[worker-{name}] Error: {e}")
-            status = "ERROR"
-            detail = f"worker-error:{e}"
 
         else:
-            # publish result
-            result = ScanResult(
-                id=record_id,
-                bucket=bucket,
-                key=key,
-                status=status,
-                virus=virus,
-                analyse=analyse,
-                details=detail,
-                original_filename=original_filename,
-                instance=instance,
-                timestamp=datetime.now(),
-                duration=round(datetime.now().timestamp() - start_timestamp, 3),
-                worker=f"worker-{name}",
-            )
-
             # Trigger webhooks for this file_id
-            data = await storage.redis_client.get("scan_webhooks")
-            hooks = json.loads(data) if data else {}
-            for url in hooks.get(record_id, []):
+            metadata = await storage.get_s3_metadata(key=key, bucket=bucket)
+            result = ScanResult(key=key, bucket=bucket, status=scan.status, virus=scan.virus, detail= scan.details)
+            if url := metadata.get("Webhook"):
                 asyncio.create_task(
-                    storage.call_webhook_and_remove(record_id, url, result.model_dump())
+                    retry_async(storage.call_webhook_and_remove(key, url, result.model_dump()))
                 )
-
-            try:
-                await producer.send_and_wait(
-                    KAFKA_OUTPUT_TOPIC, result.model_dump_json().encode("utf-8")
-                )
-            except Exception as e:
-                logger.error(f"[{result.worker}][{result.id}] Kafka error: {e}")
 
         finally:
             queue.task_done()
@@ -202,7 +146,7 @@ async def worker(
 # ----------------- CONSUMER -----------------
 async def consume_loop(queue: asyncio.Queue):
     consumer = AIOKafkaConsumer(
-        KAFKA_INPUT_TOPIC,
+        KAFKA_TOPIC,
         bootstrap_servers=KAFKA_SERVERS,  # type: ignore
         group_id="scanner-group",
         enable_auto_commit=True,

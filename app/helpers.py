@@ -56,7 +56,7 @@ async def retry_async(
 
 
 class MessageBase(BaseModel):
-    id: str
+    key: str
     status: Literal["ERROR", "PENDING", "CLEAN", "INFECTED", "UNREACHABLE"]
     timestamp: datetime = datetime.now()
     details: str | None = None
@@ -64,8 +64,7 @@ class MessageBase(BaseModel):
 
 class KafkaMessage(MessageBase):
     bucket: str | None = None
-    key: str | None = None
-    original_filename: str | None = None
+    webhook: str  | None = None
 
 
 class ClamAVResult(MessageBase):

@@ -5,8 +5,7 @@ import os
 from helpers import parse_hosts
 
 KAFKA_SERVERS = os.getenv("KAFKA_SERVERS", "kafka:9092").split(",")
-KAFKA_INPUT_TOPIC = os.getenv("KAFKA_INPUT_TOPIC", "files_to_scan")
-KAFKA_OUTPUT_TOPIC = os.getenv("KAFKA_OUTPUT_TOPIC", "scan_results")
+KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "files_to_scan")
 KAFKA_LOG_RETENTION_MS = int(os.getenv("KAFKA_LOG_RETENTION_MS", 86400000))
 
 SEARCH_TIMEOUT = float(os.getenv("SEARCH_TIMEOUT", "5"))
