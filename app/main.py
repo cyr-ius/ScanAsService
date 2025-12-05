@@ -4,10 +4,11 @@ import uuid
 from contextlib import asynccontextmanager
 
 from aiobotocore.session import get_session
-from aiokafka import AIOKafkaProducer
+from aiokafka import AIOKafkaConsumer
+from aiokafka.structs import TopicPartition
 from const import (
     KAFKA_SERVERS,
-    REDIS_URL,
+    KAFKAT_STATS,
     S3_ACCESS_KEY,
     S3_BUCKET,
     S3_ENDPOINT,
@@ -21,14 +22,11 @@ from fastapi.responses import StreamingResponse
 from helpers import ScanResult
 from mylogging import mylogging
 from pydantic import HttpUrl
-from redis import asyncio as redis
 
 CHUNK_SIZE = 64 * 1024
 
 logger = mylogging.getLogger("api")
 session = get_session()
-producer: AIOKafkaProducer
-r = redis.from_url(REDIS_URL)
 
 
 # Create a reusable asynccontextmanager for S3 client to ensure proper close
@@ -50,21 +48,7 @@ async def s3_client_ctx():
             logger.debug("Error closing s3 client: %s", e)
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Initialize Kafka producer and Redis client."""
-    global producer
-    producer = AIOKafkaProducer(bootstrap_servers=KAFKA_SERVERS, acks="all")  # type: ignore
-    await producer.start()
-    logger.info("Kafka producer started")
-    yield
-    await producer.stop()
-    logger.info("Shutdown complete")
-
-
-app = FastAPI(
-    title="ScanAV as Service (SAVaS) - API", lifespan=lifespan, version=VERSION
-)
+app = FastAPI(title="ScanAV as Service (SAVaS) - API", version=VERSION)
 
 
 @app.post("/upload")
@@ -100,7 +84,7 @@ async def download_scanned_file(id: str, force: bool = False) -> StreamingRespon
     if result.status == "PENDING":
         raise HTTPException(status_code=202, detail="File is pending scan")
     if result.status != "CLEAN" and not force:
-        raise HTTPException(status_code=404, detail=f"{result.status}:{result.data}")
+        raise HTTPException(status_code=404, detail=f"{result.status}")
 
     try:
         # Use s3_client_ctx
@@ -177,21 +161,8 @@ async def hearbeat():
 @app.get("/monitor")
 async def monitor():
     """Monitor loadbalancing."""
-    keys = await r.keys("monitor")
-    mresult = []
-    for k in keys:
-        v = await r.get(k)
-        if v:
-            mresult.append(json.loads(v))
-
-    keys = await r.keys("clamav")
-    cresult = []
-    for k in keys:
-        v = await r.get(k)
-        if v:
-            cresult.append(json.loads(v))
-
-    return {"monitor": mresult, "clamav": cresult}
+    msg = await get_last_message()
+    return {"last_message": msg}
 
 
 async def s3_object_stream(bucket: str, key: str):
@@ -210,3 +181,35 @@ async def s3_object_stream(bucket: str, key: str):
                 await body.close()
             except Exception:
                 pass
+
+
+async def get_last_message() -> dict | None:
+    consumer = AIOKafkaConsumer(
+        bootstrap_servers=KAFKA_SERVERS,
+        enable_auto_commit=False,  # ne jamais avancer l'offset
+        auto_offset_reset="latest",  # démarrer au dernier offset
+        group_id=f"api-tracker-{uuid.uuid4()}",
+    )
+    await consumer.start()
+
+    # récupérer les partitions du topic
+    partitions = consumer.partitions_for_topic(KAFKAT_STATS)
+    if not partitions:
+        await consumer.stop()
+        return None
+
+    topic_partitions = [TopicPartition(KAFKAT_STATS, p) for p in partitions]
+    consumer.assign(topic_partitions)  # assign manuel
+
+    # chercher le dernier offset et lire le dernier message
+    last_messages = []
+    for tp in topic_partitions:
+        end_offset = await consumer.end_offsets([tp])
+        last_offset = end_offset[tp] - 1
+        if last_offset >= 0:
+            consumer.seek(tp, last_offset)
+            msg = await consumer.getone()
+            last_messages.append(json.loads(msg.value.decode("utf-8")))
+
+    await consumer.stop()
+    return last_messages[-1] if last_messages else None

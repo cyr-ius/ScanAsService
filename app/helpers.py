@@ -95,7 +95,6 @@ class MessageBase(BaseModel):
     status: Literal["ERROR", "PENDING", "CLEAN", "INFECTED", "UNREACHABLE"]
     timestamp: datetime = datetime.now()
     bucket: str | None = None
-    data: str | None = None
     orginal_filename: str | None = None
 
 

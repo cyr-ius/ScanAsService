@@ -1,5 +1,4 @@
 import asyncio
-import json
 import time
 
 from const import (
@@ -8,11 +7,9 @@ from const import (
     COOLDOWN_THRESHOLD,
     EMA_ALPHA,
     FAILURE_WEIGHT,
-    REDIS_URL,
 )
 from mylogging import mylogging
 from pydantic import BaseModel
-from redis import asyncio as redis
 
 logger = mylogging.getLogger("monitor")
 
@@ -164,15 +161,7 @@ class Monitor:
             await asyncio.sleep(COOLDOWN_SECONDS / 2)
 
     async def update_monitor_state(self):
-        r = redis.from_url(REDIS_URL)
         state = {"timestamp": time.time()}
         for key, stats in self._host_stats.items():
             state.update({key: stats.model_dump()})
-
         self._statistics = state
-        try:
-            logger.debug("Monitor: %s", self._statistics)
-            await r.set("monitor", json.dumps(self._statistics))
-            await r.close()
-        except Exception as e:
-            logger.exception(f"Error to push statistics ({e})")

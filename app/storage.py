@@ -1,17 +1,14 @@
 """Class for managment S3 storage."""
 
 import asyncio
-import json
 import time
 from typing import Any
 
 from aiobotocore.session import ClientCreatorContext, get_session
 from aiohttp import ClientSession
 from const import BASE_DELAY, RETRY
-from helpers import ClamAVResult, retry
+from helpers import ClamAVResult, ScanResult, retry
 from mylogging import mylogging
-from redis import asyncio as redis
-from redis.asyncio import Redis
 
 logger = mylogging.getLogger("storage")
 
@@ -22,18 +19,19 @@ class S3Storage:
         endpoint,
         key,
         secret,
-        redis_url: str,
-        redis_timeout: int,
         clamd_timeout: float,
         region: str | None = None,
     ):
         self.endpoint = endpoint
         self.key = key
         self.secret = secret
-        self.redis_client: Redis = redis.from_url(redis_url)
-        self.redis_timeout = redis_timeout
         self._clamd_timeout = clamd_timeout
         self._statistics = {"infected": 0, "cleaned": 0, "errors": 0}
+
+    @property
+    def statistics(self):
+        """Return statis."""
+        return self._statistics
 
     async def _get_s3_client(self) -> ClientCreatorContext:
         session = get_session()
@@ -44,33 +42,13 @@ class S3Storage:
             aws_secret_access_key=self.secret,
         )
 
-    async def acquire_s3_lock(self, key: str, bucket: str) -> bool:
-        try:
-            logger.debug("Acquiring lock for %s/%s", bucket, key)
-            lock_key = f"lock:{bucket}/{key}"
-            return await self.redis_client.set(
-                lock_key, "1", nx=True, ex=self.redis_timeout
-            )
-        except Exception as e:
-            logger.exception(f"Error acquiring lock for {key}: {e}")
-            raise S3LockException(f"s3-acquire-error:{e}") from e
-
-    async def release_s3_lock(self, key: str, bucket: str) -> None:
-        try:
-            logger.debug("Releasing lock for %s/%s", bucket, key)
-            lock_key = f"lock:{bucket}/{key}"
-            await self.redis_client.delete(lock_key)
-        except Exception as e:
-            logger.exception(f"Error releasing lock for {key}: {e}")
-            raise S3UnlockException(f"s3-release-error:{e}") from e
-
     async def move_s3_object_async(
-        self, key: str, bucket: str, target: str, result: ClamAVResult | None = None
+        self, key: str, bucket: str, target: str, result: ScanResult | None = None
     ) -> None:
         """Move or copy an object within S3 bucket."""
 
         logger.debug("Moving %s/%s to %s", bucket, key, target)
-        tagging = f"status={result.status}&virus={result.virus}&detail={result.data}&analyse={result.analyse}&instance={result.instance}"
+        tagging = f"worker={result.worker}&duration={result.duration}&status={result.status}&virus={result.virus}&analyse={result.analyse}&instance={result.instance}"
         async with await self._get_s3_client() as s3_client:
             try:
                 # Get headers and merge with new metada because copy_object
@@ -101,13 +79,10 @@ class S3Storage:
                     last_modified = obj["LastModified"].timestamp()
                     if last_modified < cutoff_ts:
                         try:
-                            await self.acquire_s3_lock(bucket=bucket, key=key)
                             await s3_client.delete_object(Bucket=bucket, Key=key)  # type: ignore
                             logger.info(f"Deleted old object {bucket}/{key}")
                         except Exception as e:
                             logger.exception(f"Failed to delete {bucket}/{key}: {e}")
-                        finally:
-                            await self.release_s3_lock(bucket=bucket, key=key)
 
     async def scan_s3_object_async(
         self, key: str, bucket: str, host: str, port: int
@@ -153,7 +128,6 @@ class S3Storage:
             # Parse response
             if "OK" in response:
                 self._statistics["cleaned"] += 1
-                await self.update_monitor_state()
                 return ClamAVResult(
                     key=key,
                     status="CLEAN",
@@ -163,7 +137,6 @@ class S3Storage:
 
             if "FOUND" in response:
                 self._statistics["infected"] += 1
-                await self.update_monitor_state()
                 virus = response.split("FOUND")[0].split(":")[-1].strip()
                 return ClamAVResult(
                     key=key,
@@ -171,36 +144,13 @@ class S3Storage:
                     virus=virus,
                     instance=f"{host}:{port}",
                     analyse=round(elapsed, 3),
-                    data="Not delivery",
                 )
 
             self._statistics["errors"] += 1
-            await self.update_monitor_state()
             raise ClamAVScanException(f"clamd-scan-nostatus:{key} - {host}:{port}")
 
         except Exception as e:
             raise ClamAVException(f"clamd-scan-error:{e}") from e
-
-    async def set_s3_tags(self, key: str, bucket: str, tags: dict[str, Any]):
-        """Set tags"""
-        if len(tags) > 10:
-            raise S3TaggingException("Tags numbers exceeded")
-
-        tagging = "&".join(f"{k}={v}" for k, v in tags.items())
-        async with await self._get_s3_client() as s3_client:
-            try:
-                await s3_client.put_object(Bucket=bucket, Key=key, tagging=tagging)  # type: ignore
-            except Exception as e:
-                raise S3TaggingException(f"s3-tags-error:{e}") from e
-
-    async def get_s3_metadata(self, key: str, bucket: str) -> dict[str, Any]:
-        """Get metadata."""
-        async with await self._get_s3_client() as s3_client:
-            try:
-                head = await s3_client.head_object(Bucket=bucket, Key=key)  # type: ignore
-                return head.get("Metadata", {})
-            except Exception as e:
-                raise S3MetadataException(f"s3-metadata-error:{e}") from e
 
     @retry(tries=RETRY, delay=BASE_DELAY, logger=logger)
     async def call_webhook_and_remove(self, key: str, url: str, payload: dict):
@@ -208,13 +158,6 @@ class S3Storage:
             logger.info("Calling webhook %s", key)
             async with session.post(url, json=payload):
                 logger.info(f"Webhook {url} successfully called for file {key}")
-
-    async def update_monitor_state(self):
-        try:
-            logger.debug("ClamAV statistics: %s", self._statistics)
-            await self.redis_client.set("clamav", json.dumps(self._statistics))
-        except Exception as e:
-            logger.exception(f"Error to push statistics ({e})")
 
     def bucket_key(self, kafkat_payload: dict[str, Any]) -> tuple[str, str, str]:
         """Return bucket, key, metadata from payload."""
@@ -227,11 +170,6 @@ class S3Storage:
                 return key, bucket, metadata
 
         raise S3BucketKeyException("Unable to determine the bucket and key")
-
-    async def async_close(self):
-        """Close."""
-        await self.redis_client.aclose()
-        await self.redis_client.connection_pool.disconnect()
 
 
 class S3StorageException(Exception):

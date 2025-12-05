@@ -13,9 +13,8 @@ from const import (
     KAFKA_LOG_RETENTION_MS,
     KAFKA_SERVERS,
     KAFKA_TOPIC,
+    KAFKAT_STATS,
     MAX_CONCURRENT_SCANS,
-    REDIS_LOCK_TIMEOUT,
-    REDIS_URL,
     RETRY,
     S3_ACCESS_KEY,
     S3_BUCKET,
@@ -24,7 +23,7 @@ from const import (
     S3_SCAN_RESULT,
     S3_SECRET_KEY,
 )
-from helpers import ScanResult, retry
+from helpers import ClamAVResult, ScanResult, retry
 from monitor import Monitor
 from mylogging import mylogging
 from storage import (
@@ -62,12 +61,17 @@ def fire_and_forget(coro: Awaitable[None]):
     delay=BASE_DELAY,
 )
 async def worker(
-    worker_id: str, storage: S3Storage, monitor: Monitor, payload: Dict[str, Any]
+    worker_id: str,
+    storage: S3Storage,
+    monitor: Monitor,
+    payload: Dict[str, Any],
+    producer: AIOKafkaProducer,
 ) -> None:
     """Worker that selects the best host adaptively, performs scan, updates stats and moves object."""
     async with scan_semaphore:
         try:
             logger.info(f"[worker-{worker_id}] Start scan.")
+            start_time = time.monotonic()
 
             # Extract object key, bucket and metadata
             try:
@@ -78,11 +82,6 @@ async def worker(
 
             metadata = metadata or {}
 
-            # Acquire S3 lock
-            if not await storage.acquire_s3_lock(key, bucket):
-                logger.warning(f"[worker-{worker_id}] File locked, skipping {key}")
-
-            scan = None
             attempt = 0
             last_exception = None
 
@@ -120,36 +119,41 @@ async def worker(
                 if scan.status == "CLEAN"
                 else f"{S3_SCAN_QUARANTINE}/{key}"
             )
-            await storage.move_s3_object_async(key, bucket, target, scan)
+
+            duration = time.monotonic() - start_time
+            scan = scan or ClamAVResult()
+            result = ScanResult(
+                bucet=bucket, worker=worker_id, duration=duration, **scan.model_dump()
+            )
+            await storage.move_s3_object_async(key, bucket, target, result)
             logger.info(f"[worker-{worker_id}] Scanned {key} → {scan.status}")
 
         finally:
-            # Always release lock if acquired
-            try:
-                await storage.release_s3_lock(key, bucket)
-            except Exception:
-                logger.warning(f"[worker-{worker_id}] Finally unlock error")
+            await producer.send_and_wait(
+                KAFKA_TOPIC, value=result.model_dump_json().encode("utf-8")
+            )
+            await producer.send_and_wait(
+                KAFKAT_STATS,
+                value=json.dumps(
+                    {**storage.statistics, "monitor": monitor.statistics}
+                ).encode("utf-8"),
+            )
 
-        # Fire webhook if present
-        if (
-            metadata
-            and (url := metadata.get("X-Amz-Meta-Webhook"))
-            and scan is not None
-        ):
-            result = ScanResult(
-                key=key,
-                bucket=bucket,
-                status=scan.status,
-                virus=scan.virus,
-                data=scan.data,
-            )
-            fire_and_forget(
-                storage.call_webhook_and_remove(key, url, result.model_dump_json())
-            )
+            # Fire webhook if present
+            if (
+                metadata
+                and (url := metadata.get("X-Amz-Meta-Webhook"))
+                and scan is not None
+            ):
+                fire_and_forget(
+                    storage.call_webhook_and_remove(key, url, result.model_dump_json())
+                )
 
 
 # ----------------- CONSUMER -----------------
-async def consume_loop(storage: S3Storage, monitor: Monitor):
+async def consume_loop(
+    producer: AIOKafkaProducer, storage: S3Storage, monitor: Monitor
+):
     consumer = AIOKafkaConsumer(
         KAFKA_TOPIC,
         bootstrap_servers=KAFKA_SERVERS,  # type: ignore
@@ -167,7 +171,7 @@ async def consume_loop(storage: S3Storage, monitor: Monitor):
                 "EventName"
             ) == "s3:ObjectCreated:Put":
                 # Use key as worker_id
-                asyncio.create_task(worker(key, storage, monitor, payload))
+                asyncio.create_task(worker(key, storage, monitor, payload, producer))
     finally:
         await consumer.stop()
 
@@ -195,8 +199,6 @@ async def main():
         S3_ENDPOINT,
         S3_ACCESS_KEY,
         S3_SECRET_KEY,
-        REDIS_URL,
-        REDIS_LOCK_TIMEOUT,
         CLAMD_CNX_TIMEOUT,
     )
 
@@ -206,13 +208,12 @@ async def main():
     asyncio.create_task(monitor.reset_host_failures_periodically())
     asyncio.create_task(periodic_cleanup_task(storage))
 
-    consumer_task = asyncio.create_task(consume_loop(storage, monitor))
+    consumer_task = asyncio.create_task(consume_loop(producer, storage, monitor))
 
     try:
         await consumer_task
     finally:
         await producer.stop()
-        await storage.async_close()
 
 
 if __name__ == "__main__":
