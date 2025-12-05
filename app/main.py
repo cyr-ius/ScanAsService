@@ -3,11 +3,10 @@ import json
 import uuid
 from contextlib import asynccontextmanager
 
-from aiobotocore.session import AioSession, get_session
+from aiobotocore.session import get_session
 from aiokafka import AIOKafkaProducer
 from const import (
     KAFKA_SERVERS,
-    KAFKA_TOPIC,
     REDIS_URL,
     S3_ACCESS_KEY,
     S3_BUCKET,
@@ -17,15 +16,14 @@ from const import (
     S3_SECRET_KEY,
     VERSION,
 )
-from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
-from helpers import KafkaMessage, ScanResult, retry_async
+from helpers import ScanResult
 from mylogging import mylogging
 from pydantic import HttpUrl
 from redis import asyncio as redis
-from starlette.background import BackgroundTask
 
-WEBHOOKS_KEY = "scan_webhooks"
+CHUNK_SIZE = 64 * 1024
 
 logger = mylogging.getLogger("api")
 session = get_session()
@@ -76,9 +74,15 @@ async def upload_file_to_scan(
     """Upload file to S3 and send scan request to Kafka."""
     key = str(uuid.uuid4())
     data = await file.read()
+    if url and len(url) > 128:
+        raise HTTPException(
+            status_code=503, detail="Webhook url: length exceeded (max: 128)"
+        )
     try:
         async with s3_client_ctx() as client:  # type: ignore
             metadata = {"OriginalFilename": file.filename}
+            if url is not None:
+                metadata = {**metadata, "Webhook": str(url)}
             await client.put_object(
                 Bucket=S3_BUCKET, Key=key, Body=data, Metadata=metadata
             )  # type: ignore
@@ -86,18 +90,7 @@ async def upload_file_to_scan(
         logger.exception("S3 put_object failed")
         raise HTTPException(status_code=503, detail=f"Storage unavailable: {e}")
 
-    # Send Kafka message with retries
-    payload = KafkaMessage(key=key, bucket=S3_BUCKET, status="PENDING")
-
-    try:
-        await producer.send_and_wait(
-            KAFKA_TOPIC, value=payload.model_dump_json().encode("utf-8")
-        )
-    except Exception as e:
-        logger.exception("Kafka send failed (%s)", e)
-        raise HTTPException(status_code=503, detail=f"Message broker unavailable: {e}")
-
-    return ScanResult(key=key, status="PENDING", webhook=url)
+    return ScanResult(key=key, status="PENDING", webhook=str(url))
 
 
 @app.get("/download/{id}")
@@ -107,23 +100,23 @@ async def download_scanned_file(id: str, force: bool = False) -> StreamingRespon
     if result.status == "PENDING":
         raise HTTPException(status_code=202, detail="File is pending scan")
     if result.status != "CLEAN" and not force:
-        raise HTTPException(status_code=404, detail=result.details)
-
-    # Use s3_client_ctx
-    async def _get() -> AioSession:
-        async with s3_client_ctx() as s3_client:
-            return await s3_client.get_object(Bucket=S3_BUCKET, Key=result.key)  # type: ignore
+        raise HTTPException(status_code=404, detail=f"{result.status}:{result.data}")
 
     try:
-        resp = await retry_async(_get, retries=6, base_delay=0.5)
-        filename = resp.get("Metadata", {}).get("OriginalFilename", "unkown_name")
-        body = resp["Body"]
+        # Use s3_client_ctx
+        async with s3_client_ctx() as s3_client:
+            obj_meta = await s3_client.head_object(
+                Bucket=S3_BUCKET, Key=f"{result.bucket}/{result.key}"
+            )
+            filename = obj_meta.get("Metadata", {}).get(
+                "originalfilename", "unknown_name"
+            )
+
         headers = {"Content-Disposition": f"attachment; filename={filename}"}
         return StreamingResponse(
-            body,
+            s3_object_stream(S3_BUCKET, f"{result.bucket}/{result.key}"),
             media_type="application/octet-stream",
             headers=headers,
-            background=BackgroundTask(body.close),
         )
 
     except Exception as e:
@@ -138,20 +131,41 @@ async def scan_status(id: str) -> ScanResult:
     """Fetch scan result by ID."""
 
     async with s3_client_ctx() as s3_client:
-        for bucket in [S3_BUCKET, S3_SCAN_RESULT, S3_SCAN_QUARANTINE]:
+        tags = {}
+        for bucket in [S3_SCAN_RESULT, S3_SCAN_QUARANTINE]:
             try:
-                obj = await s3_client.get_object_tagging(Bucket=bucket, Key=id)
-                if tags := obj.get("TagSet"):
-                    tags = {t["Key"]: t["Value"] for t in tags}
-                break
+                obj = await s3_client.head_object(
+                    Bucket=S3_BUCKET, Key=f"{bucket}/{id}"
+                )
+                metadata = obj.get("Metadata", {})
+                if obj.get("TagCount"):
+                    obj_tags = await s3_client.get_object_tagging(
+                        Bucket=S3_BUCKET, Key=f"{bucket}/{id}"
+                    )
+                    tags = {t["Key"]: t["Value"] for t in obj_tags.get("TagSet", [])}
+                return ScanResult(
+                    key=id,
+                    bucket=bucket,
+                    orginal_filename=metadata.get("originalfilename"),
+                    webhook=metadata.get("webhook"),
+                    **tags,
+                )
             except Exception:
                 continue
-        if bucket == S3_BUCKET:
-            return ScanResult(key=id, status_code=202, detail="File is pending scan")
-        if tags.get("status") in ["CLEAN", "INFECTED"]:
-            return ScanResult(key=id, bucket=bucket, **tags)
+        try:
+            if await s3_client.head_object(Bucket=S3_BUCKET, Key=id):
+                return ScanResult(key=id, bucket=S3_BUCKET, status="PENDING")
+        except Exception as e:
+            logger.exception("Download error (%s)", e)
+            raise HTTPException(
+                status_code=404, detail=f"File not found or storage unavailable ({e})"
+            )
 
-        return ScanResult(key=id, status="ERROR", detail="File not found")
+
+@app.post("/test/webhook")
+async def webhook_s3_events(request: Request):
+    data = await request.json()  # Récupère le JSON envoyé
+    logger.info("[TEST WEBHHOK] %s", data)
 
 
 @app.get("/heartbeat", status_code=204)
@@ -161,7 +175,7 @@ async def hearbeat():
 
 
 @app.get("/monitor")
-async def loadbalcenr_monitor():
+async def monitor():
     """Monitor loadbalancing."""
     keys = await r.keys("monitor")
     mresult = []
@@ -178,3 +192,21 @@ async def loadbalcenr_monitor():
             cresult.append(json.loads(v))
 
     return {"monitor": mresult, "clamav": cresult}
+
+
+async def s3_object_stream(bucket: str, key: str):
+    """Stream S3 object."""
+    async with s3_client_ctx() as s3_client:  # type: ignore
+        resp = await s3_client.get_object(Bucket=bucket, Key=key)  # type: ignore
+        body = resp["Body"]
+        try:
+            async for chunk in body.iter_chunks(CHUNK_SIZE):
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            # assure close du body si nécessaire
+            try:
+                await body.close()
+            except Exception:
+                pass

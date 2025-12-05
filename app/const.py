@@ -8,8 +8,8 @@ KAFKA_SERVERS = os.getenv("KAFKA_SERVERS", "kafka:9092").split(",")
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "files_to_scan")
 KAFKA_LOG_RETENTION_MS = int(os.getenv("KAFKA_LOG_RETENTION_MS", 86400000))
 
-SEARCH_TIMEOUT = float(os.getenv("SEARCH_TIMEOUT", "5"))
 VERSION = os.getenv("APP_VERSION", "unknown")
+MAX_CONCURRENT_SCANS = int(os.getenv("MAX_CONCURRENT_SCANS", 10))
 
 S3_ENDPOINT = os.getenv("S3_ENDPOINT_URL", "http://minio:9000")
 S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "minioadmin")
@@ -20,13 +20,12 @@ S3_SCAN_QUARANTINE = os.getenv("S3_SCAN_QUARANTINE", "quarantine")
 
 CLAMD_HOSTS = parse_hosts(os.getenv("CLAMD_HOSTS", "clamav:3310"))
 CLAMD_CNX_TIMEOUT = float(os.getenv("CLAMD_CNX_TIMEOUT", 10))
-CLAMD_RETRY = int(os.getenv("CLAMD_RETRY", 3))  # number of retries (different hosts)
-BASE_DELAY = float(os.getenv("BASE_DELAY", 0.5))
+
+RETRY = int(os.getenv("RETRY", 3))
+BASE_DELAY = float(os.getenv("BASE_DELAY", 20))
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 REDIS_LOCK_TIMEOUT = int(os.getenv("REDIS_LOCK_TIMEOUT", 15))
-
-WORKER_POOL = int(os.getenv("WORKER_POOL", 4))
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LIB_LOG_LEVEL = os.getenv("LIB_LOG_LEVEL", "WARNING").upper()

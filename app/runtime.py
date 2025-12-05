@@ -2,154 +2,154 @@
 import asyncio
 import json
 import time
+from collections.abc import Awaitable
+from typing import Any, Dict
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from const import (
     BASE_DELAY,
     CLAMD_CNX_TIMEOUT,
     CLAMD_HOSTS,
-    CLAMD_RETRY,
     KAFKA_LOG_RETENTION_MS,
     KAFKA_SERVERS,
     KAFKA_TOPIC,
+    MAX_CONCURRENT_SCANS,
     REDIS_LOCK_TIMEOUT,
     REDIS_URL,
+    RETRY,
     S3_ACCESS_KEY,
     S3_BUCKET,
     S3_ENDPOINT,
     S3_SCAN_QUARANTINE,
     S3_SCAN_RESULT,
     S3_SECRET_KEY,
-    WORKER_POOL,
 )
-from helpers import ScanResult, retry_async
+from helpers import ScanResult, retry
 from monitor import Monitor
 from mylogging import mylogging
 from storage import (
     ClamAVException,
     ClamAVFailedAll,
+    S3BucketKeyException,
     S3LockException,
     S3MoveException,
     S3Storage,
-    S3UnlockException,
 )
 
 logger = mylogging.getLogger("scanav")
 
+# Limit max concurrent scans
+scan_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SCANS)
+
+
+# ----------------- UTILITIES -----------------
+def fire_and_forget(coro: Awaitable[None]):
+    """Run an async task in background and log exceptions."""
+
+    async def wrapper():
+        try:
+            await coro
+        except Exception as e:
+            logger.error("Background task failed: %s", e)
+
+    asyncio.create_task(wrapper())
+
 
 # ----------------- WORKER -----------------
+@retry(
+    exceptions=(S3LockException, S3MoveException, ClamAVFailedAll),
+    tries=RETRY,
+    delay=BASE_DELAY,
+)
 async def worker(
-    name: int,
-    queue: asyncio.Queue,
-    producer: AIOKafkaProducer,
-    storage: S3Storage,
-    monitor: Monitor,
+    worker_id: str, storage: S3Storage, monitor: Monitor, payload: Dict[str, Any]
 ) -> None:
-    """
-    Worker that selects the best host adaptively, performs scan, updates stats and moves object.
-    """
-    while True:
-        payload = await queue.get()
+    """Worker that selects the best host adaptively, performs scan, updates stats and moves object."""
+    async with scan_semaphore:
         try:
-            # start_timestamp = datetime.now().timestamp()
-            bucket = payload["bucket"]
-            key = payload["key"]
+            logger.info(f"[worker-{worker_id}] Start scan.")
 
-            logger.info(f"[worker-{name}] Start scan {key}")
+            # Extract object key, bucket and metadata
+            try:
+                key, bucket, metadata = storage.bucket_key(payload)
+            except S3BucketKeyException as e:
+                logger.error(f"[worker-{worker_id}] bucket/key not found: {e}")
+                return
 
-            # Acquire lock
+            metadata = metadata or {}
+
+            # Acquire S3 lock
             if not await storage.acquire_s3_lock(key, bucket):
-                logger.warning(f"[worker-{name}] File locked, skipping {key}")
-                queue.task_done()
-                continue
+                logger.warning(f"[worker-{worker_id}] File locked, skipping {key}")
 
-            # Scan file using adaptive selection
+            scan = None
             attempt = 0
             last_exception = None
-            while attempt < CLAMD_RETRY:
-                attempt += 1
-                # choose best host
-                host, port, host_key = await monitor.select_best_host()
 
-                # mark busy
+            while attempt < RETRY:
+                attempt += 1
+                host, port, host_key = await monitor.select_best_host()
                 await monitor.mark_host_busy(host_key)
                 scan_start = time.monotonic()
+
                 try:
                     scan = await storage.scan_s3_object_async(key, bucket, host, port)
                 except ClamAVException as e:
-                    elapsed = time.monotonic() - scan_start
-                    # mark done with failure (no elapsed update)
                     await monitor.mark_host_done(host_key, elapsed=None, success=False)
-                    logger.warning(
-                        f"[worker-{name}] ClamAV attempt failed on {host_key}: {e} (attempt {attempt})"
-                    )
                     last_exception = e
-                    # small backoff before next attempt
+                    logger.warning(
+                        f"[worker-{worker_id}] ClamAV attempt failed on {host_key}: {e} (attempt {attempt})"
+                    )
                     await asyncio.sleep(BASE_DELAY * (2 ** (attempt - 1)))
                     continue
                 else:
                     elapsed = time.monotonic() - scan_start
-                    # success or deterministic error from engine -> mark done success if CLEAN/INFECTED, else success False
                     await monitor.mark_host_done(
                         host_key, elapsed=elapsed, success=True
                     )
-                    break  # exit retry loop
-
+                    break
             else:
-                # exhausted retries
                 logger.error(
-                    f"[worker-{name}] All CLAMD attempts failed for {key}: {last_exception}"
+                    f"[worker-{worker_id}] All CLAMD attempts failed for {key}: {last_exception}"
                 )
                 raise ClamAVFailedAll(last_exception)
 
-            # move object according to result if scan succeeded (or even on ERROR we may want to move to quarantine)
+            # Move object based on scan result
             target = (
                 f"{S3_SCAN_RESULT}/{key}"
                 if scan.status == "CLEAN"
                 else f"{S3_SCAN_QUARANTINE}/{key}"
             )
             await storage.move_s3_object_async(key, bucket, target, scan)
+            logger.info(f"[worker-{worker_id}] Scanned {key} → {scan.status}")
 
-            logger.info(f"[worker-{name}] Scanned {key} → {scan.status}")
+        finally:
+            # Always release lock if acquired
+            try:
+                await storage.release_s3_lock(key, bucket)
+            except Exception:
+                logger.warning(f"[worker-{worker_id}] Finally unlock error")
 
-            # release S3 lock
-            await storage.release_s3_lock(key, bucket)
-
-        except S3LockException as e:
-            logger.error(f"[worker-{name}] Lock error: {e}")
-
-        except S3MoveException as e:
-            logger.error(f"[worker-{name}] Move error: {e}")
-
-        except S3UnlockException as e:
-            logger.error(f"[worker-{name}] Unlock error: {e}")
-
-        except Exception as e:
-            logger.error(f"[worker-{name}] Error: {e}")
-
-        else:
-            # Trigger webhooks for this file_id
-            metadata = await storage.get_s3_metadata(key=key, bucket=bucket)
+        # Fire webhook if present
+        if (
+            metadata
+            and (url := metadata.get("X-Amz-Meta-Webhook"))
+            and scan is not None
+        ):
             result = ScanResult(
                 key=key,
                 bucket=bucket,
                 status=scan.status,
                 virus=scan.virus,
-                detail=scan.details,
+                data=scan.data,
             )
-            if url := metadata.get("Webhook"):
-                asyncio.create_task(
-                    retry_async(
-                        storage.call_webhook_and_remove(key, url, result.model_dump())
-                    )
-                )
-
-        finally:
-            queue.task_done()
+            fire_and_forget(
+                storage.call_webhook_and_remove(key, url, result.model_dump_json())
+            )
 
 
 # ----------------- CONSUMER -----------------
-async def consume_loop(queue: asyncio.Queue):
+async def consume_loop(storage: S3Storage, monitor: Monitor):
     consumer = AIOKafkaConsumer(
         KAFKA_TOPIC,
         bootstrap_servers=KAFKA_SERVERS,  # type: ignore
@@ -159,18 +159,22 @@ async def consume_loop(queue: asyncio.Queue):
     await consumer.start()
     try:
         async for msg in consumer:
-            if msg.value is None:
+            if not msg.value:
                 continue
             payload = json.loads(msg.value.decode("utf-8"))
-            await queue.put(payload)
+            logger.debug("Kafka payload: %s", payload)
+            if (key := payload.get("Key")) and payload.get(
+                "EventName"
+            ) == "s3:ObjectCreated:Put":
+                # Use key as worker_id
+                asyncio.create_task(worker(key, storage, monitor, payload))
     finally:
         await consumer.stop()
 
 
-# ----------------- CLEANUP TASKS -----------------
+# ----------------- CLEANUP TASK -----------------
 async def periodic_cleanup_task(storage: S3Storage) -> None:
     """Run cleanup periodically."""
-
     while True:
         try:
             await storage.cleanup_s3_folder(
@@ -181,13 +185,11 @@ async def periodic_cleanup_task(storage: S3Storage) -> None:
             )
         except Exception as e:
             logger.exception(f"[task-cleanup] Cleanup task error: {e}")
-        # Wait 12 hours before next cleanup
         await asyncio.sleep(KAFKA_LOG_RETENTION_MS / 1000 / 2)
 
 
 # ----------------- MAIN -----------------
 async def main():
-    queue = asyncio.Queue(maxsize=WORKER_POOL * 2)
     monitor = Monitor(CLAMD_HOSTS)
     storage = S3Storage(
         S3_ENDPOINT,
@@ -204,18 +206,11 @@ async def main():
     asyncio.create_task(monitor.reset_host_failures_periodically())
     asyncio.create_task(periodic_cleanup_task(storage))
 
-    workers = [
-        asyncio.create_task(worker(i + 1, queue, producer, storage, monitor))
-        for i in range(WORKER_POOL)
-    ]
-
-    consumer_task = asyncio.create_task(consume_loop(queue))
+    consumer_task = asyncio.create_task(consume_loop(storage, monitor))
 
     try:
         await consumer_task
     finally:
-        for w in workers:
-            w.cancel()
         await producer.stop()
         await storage.async_close()
 

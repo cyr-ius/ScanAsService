@@ -1,11 +1,14 @@
 """Helpers for the application."""
 
 import asyncio
+import functools
 import logging
-from collections.abc import Callable, Coroutine
+import random
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any, Literal
 
+from exception import TimeoutExceededError
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -29,42 +32,71 @@ def parse_hosts(s: str, port: int = 3310) -> list[tuple[str, int]]:
     return out
 
 
-async def retry_async(
-    func: Callable[..., Coroutine[Any, Any, Any]],
-    *args,
-    retries: int = 5,
-    base_delay: float = 0.5,
-    max_delay: float = 10.0,
-    **kwargs,
-):
-    """Retry async function with exponential backoff."""
-    delay = base_delay
-    last_exception: Exception | None = None
-    for attempt in range(1, retries + 1):
-        try:
-            return await func(*args, **kwargs)
-        except Exception as error:
-            last_exception = error
-            logger.warning("Attempt %d failed: %s", attempt, error)
-            if attempt == retries:
-                break
-            await asyncio.sleep(min(delay, max_delay))
-            delay *= 2
-    if last_exception is not None:
-        raise last_exception
-    raise RuntimeError("retry_async failed without raising an exception")
+def retry(
+    exceptions: Any = Exception,
+    tries: int = -1,
+    delay: float = 0,
+    max_delay: int | None = None,
+    backoff: int = 1,
+    jitter: int | tuple[int, int] = 0,
+    logger: Any = logger,
+) -> Callable[..., Any]:
+    """Retry Decorator.
+
+    :param exceptions: an exception or a tuple of exceptions to catch. default: Exception.
+    :param tries: the maximum number of attempts. default: -1 (infinite).
+    :param delay: initial delay between attempts. default: 0.
+    :param max_delay: the maximum value of delay. default: None (no limit).
+    :param backoff: multiplier applied to delay between attempts. default: 1 (no backoff).
+    :param jitter: extra seconds added to delay between attempts. default: 0.
+                   fixed if a number, random if a range tuple (min, max)
+    :param logger: logger.warning(fmt, error, delay) will be called on failed attempts.
+                   default: retry.logging_logger. if None, logging is disabled.
+    :returns: the result of the f function.
+    """
+
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        """Add decorator."""
+
+        @functools.wraps(func)
+        async def newfn(*args: Any, **kwargs: Any) -> Any:
+            """Load function."""
+            _tries, _delay = tries, delay
+            while _tries:
+                try:
+                    return await func(*args, **kwargs)
+                except exceptions as error:  # pylint: disable=broad-except
+                    _tries -= 1
+                    if not _tries:
+                        logger.error("%s, timeout exceeded", error)
+                        raise TimeoutExceededError(error) from error
+
+                    if logger is not None:
+                        logger.warning("%s, trying again in %s seconds", error, _delay)
+
+                    await asyncio.sleep(_delay)
+                    _delay *= backoff
+
+                    if isinstance(jitter, tuple):
+                        _delay += random.uniform(*jitter)
+                    else:
+                        _delay += jitter
+
+                    if max_delay is not None:
+                        _delay = min(_delay, max_delay)
+
+        return newfn
+
+    return decorator
 
 
 class MessageBase(BaseModel):
     key: str
     status: Literal["ERROR", "PENDING", "CLEAN", "INFECTED", "UNREACHABLE"]
     timestamp: datetime = datetime.now()
-    details: str | None = None
-
-
-class KafkaMessage(MessageBase):
     bucket: str | None = None
-    webhook: str  | None = None
+    data: str | None = None
+    orginal_filename: str | None = None
 
 
 class ClamAVResult(MessageBase):
@@ -73,14 +105,6 @@ class ClamAVResult(MessageBase):
     analyse: float | None = None
 
 
-class ScanResult(ClamAVResult, KafkaMessage, MessageBase):
+class ScanResult(ClamAVResult, MessageBase):
     duration: float | None = None
     worker: str | None = None
-
-
-class ScanAVException(Exception):
-    """Custom exception for scan errors."""
-
-
-class KafkaSendException(ScanAVException):
-    """Custom exception for Kafka send errors."""

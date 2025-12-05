@@ -7,7 +7,8 @@ from typing import Any
 
 from aiobotocore.session import ClientCreatorContext, get_session
 from aiohttp import ClientSession
-from helpers import ClamAVResult
+from const import BASE_DELAY, RETRY
+from helpers import ClamAVResult, retry
 from mylogging import mylogging
 from redis import asyncio as redis
 from redis.asyncio import Redis
@@ -43,28 +44,24 @@ class S3Storage:
             aws_secret_access_key=self.secret,
         )
 
-    async def acquire_s3_lock(
-        self,
-        key: str,
-        bucket: str,
-    ) -> bool:
+    async def acquire_s3_lock(self, key: str, bucket: str) -> bool:
         try:
-            logger.debug("Acquiring lock for %s/%s")
+            logger.debug("Acquiring lock for %s/%s", bucket, key)
             lock_key = f"lock:{bucket}/{key}"
             return await self.redis_client.set(
                 lock_key, "1", nx=True, ex=self.redis_timeout
             )
         except Exception as e:
-            logger.exception(f"Error acquiring lock for {bucket}/{key}: {e}")
+            logger.exception(f"Error acquiring lock for {key}: {e}")
             raise S3LockException(f"s3-acquire-error:{e}") from e
 
     async def release_s3_lock(self, key: str, bucket: str) -> None:
         try:
-            logger.debug("Releasing lock for %s/%s")
+            logger.debug("Releasing lock for %s/%s", bucket, key)
             lock_key = f"lock:{bucket}/{key}"
             await self.redis_client.delete(lock_key)
         except Exception as e:
-            logger.exception(f"Error releasing lock for {bucket}/{key}: {e}")
+            logger.exception(f"Error releasing lock for {key}: {e}")
             raise S3UnlockException(f"s3-release-error:{e}") from e
 
     async def move_s3_object_async(
@@ -73,7 +70,7 @@ class S3Storage:
         """Move or copy an object within S3 bucket."""
 
         logger.debug("Moving %s/%s to %s", bucket, key, target)
-        tagging = "&".join(f"{k}={v}" for k, v in result.model_dump().items())
+        tagging = f"status={result.status}&virus={result.virus}&detail={result.data}&analyse={result.analyse}&instance={result.instance}"
         async with await self._get_s3_client() as s3_client:
             try:
                 # Get headers and merge with new metada because copy_object
@@ -83,6 +80,7 @@ class S3Storage:
                     Key=target,
                     CopySource={"Bucket": bucket, "Key": key},
                     Tagging=tagging,
+                    TaggingDirective="REPLACE",
                 )  # type: ignore
                 await s3_client.delete_object(Bucket=bucket, Key=key)  # type: ignore
             except Exception as e:
@@ -173,6 +171,7 @@ class S3Storage:
                     virus=virus,
                     instance=f"{host}:{port}",
                     analyse=round(elapsed, 3),
+                    data="Not delivery",
                 )
 
             self._statistics["errors"] += 1
@@ -201,30 +200,14 @@ class S3Storage:
                 head = await s3_client.head_object(Bucket=bucket, Key=key)  # type: ignore
                 return head.get("Metadata", {})
             except Exception as e:
-                raise S3MetadataException(f"s3-tags-error:{e}") from e
+                raise S3MetadataException(f"s3-metadata-error:{e}") from e
 
-    async def call_webhook_and_remove(self, file_id: str, url: str, payload: dict):
-        try:
-            async with ClientSession() as session:
-                async with session.post(url, json=payload) as resp:
-                    if resp.status != 200:
-                        logger.warning(f"Webhook {url} returned status {resp.status}")
-                    else:
-                        logger.info(
-                            f"Webhook {url} successfully called for file {file_id}"
-                        )
-        except Exception as e:
-            logger.error(f"Failed to call webhook {url} for file {file_id}: {e}")
-        finally:
-            # Remove URL from Redis after calling
-            data = await self.redis_client.get("scan_webhooks")
-            hooks = json.loads(data) if data else {}
-            if file_id in hooks and url in hooks[file_id]:
-                hooks[file_id].remove(url)
-                if not hooks[file_id]:
-                    del hooks[file_id]
-                await self.redis_client.set("scan_webhooks", json.dumps(hooks))
-                logger.debug(f"Webhook {url} unsubscribed for file {file_id}")
+    @retry(tries=RETRY, delay=BASE_DELAY, logger=logger)
+    async def call_webhook_and_remove(self, key: str, url: str, payload: dict):
+        async with ClientSession(raise_for_status=True) as session:
+            logger.info("Calling webhook %s", key)
+            async with session.post(url, json=payload):
+                logger.info(f"Webhook {url} successfully called for file {key}")
 
     async def update_monitor_state(self):
         try:
@@ -232,6 +215,18 @@ class S3Storage:
             await self.redis_client.set("clamav", json.dumps(self._statistics))
         except Exception as e:
             logger.exception(f"Error to push statistics ({e})")
+
+    def bucket_key(self, kafkat_payload: dict[str, Any]) -> tuple[str, str, str]:
+        """Return bucket, key, metadata from payload."""
+        if "Records" in kafkat_payload and len(kafkat_payload["Records"]) == 1:
+            record = kafkat_payload["Records"][0]
+            bucket = record.get("s3", {}).get("bucket", {}).get("name")
+            key = record.get("s3", {}).get("object", {}).get("key")
+            metadata = record.get("s3", {}).get("object", {}).get("userMetadata")
+            if bucket is not None and key is not None and metadata:
+                return key, bucket, metadata
+
+        raise S3BucketKeyException("Unable to determine the bucket and key")
 
     async def async_close(self):
         """Close."""
@@ -264,6 +259,10 @@ class S3UnlockException(S3StorageException):
 
 
 class S3MetadataException(S3StorageException):
+    """Custom exception for S3 unlock errors."""
+
+
+class S3BucketKeyException(S3StorageException):
     """Custom exception for S3 unlock errors."""
 
 

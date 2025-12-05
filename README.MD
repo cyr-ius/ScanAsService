@@ -49,7 +49,7 @@ Remarque : certaines valeurs sont spécifiques à l'image Kafka et à sa configu
 - CLAMD_CNX_TIMEOUT
   - Description : timeout (secondes) pour établir la connexion TCP vers clamd.
   - Exemple : 10
-- CLAMD_RETRY
+- RETRY
   - Description : nombre de tentatives (sur différents hosts) avant d'abandonner le scan.
   - Exemple : 3
 - BASE_DELAY
@@ -90,7 +90,7 @@ Remarque : certaines valeurs sont spécifiques à l'image Kafka et à sa configu
   - Description : alpha pour l'exponential moving average (moyenne mobile) du temps de scan.
   - Exemple : 0.2
 
-Conseil : ajustez ces variables selon votre charge et votre topologie. Par exemple augmentez WORKER_POOL pour plus de parallélisme, ou réduisez CLAMD_RETRY si vos daemons sont instables.
+Conseil : ajustez ces variables selon votre charge et votre topologie. Par exemple augmentez WORKER_POOL pour plus de parallélisme, ou réduisez RETRY si vos daemons sont instables.
 
 ### Service Kafka (variables Kafka importantes)
 

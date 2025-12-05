@@ -72,7 +72,9 @@ services:
       sh -c "
       sleep 10 &&
       mc alias set local http://minio:9000 minioadmin minioadmin &&
-      mc mb -p local/scans || echo 'Bucket files already exists'
+      mc mb -p local/scans || echo 'Bucket files already exists' &&
+      mc admin config set myminio notify_webhook:1 endpoint="http://localhost:8000/minio/events" queue_limit="10000" queue_dir="/tmp/minio-queue"
+      mc admin config set myminio notify_sqs:1 enable="on" queue_url="http://localhost:9324/queue/myqueue" access_key="minioaccess" secret_key="miniosecret" queue_dir="/tmp/minio-queue"
       "
 
   scanner:

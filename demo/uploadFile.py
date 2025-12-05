@@ -6,7 +6,7 @@ import aiohttp
 
 API_URL = "http://192.168.1.1:8000"  # ton API FastAPI
 CLEAN_FILE_PATH = "demo/test_upload.txt"  # fichier à uploader
-INFECTED_FILE_PATH = "demo/test_upload1.com"  # fichier à uploader
+INFECTED_FILE_PATH = "demo/test_upload.com"  # fichier à uploader
 CONCURRENT_UPLOADS = 20  # nombre de dépôts simultanés
 
 
@@ -18,8 +18,7 @@ async def upload_file(session, path):
                 if resp.status == 200:
                     result = await resp.json()
                     print(f"Upload réussi: {result}")
-                    record_id = result["id"]
-                    await poll_result(session, record_id)
+                    await poll_result(session, result["key"])
                 elif resp.status == 409:
                     print(f"⚠️ Fichier déjà existant: {path}")
                 else:
